@@ -1,0 +1,16 @@
+[package]
+name = "lmdb-explorer"
+version = "0.1.0"
+edition = "2021"
+description = "Interactive LMDB browser for HyperBEAM offset index stores"
+
+[[bin]]
+name = "lmdb-explorer"
+path = "src/main.rs"
+
+[dependencies]
+lmdb = "0.8"
+lmdb-sys = "0.8"
+base64 = "0.22"
+clap = { version = "4", features = ["derive"] }
+colored = "2"
