@@ -48,6 +48,10 @@ struct Args {
     /// Dump all entries without interactive navigation
     #[arg(long)]
     dump: bool,
+
+    /// Analyze partition distribution across all keys
+    #[arg(long)]
+    partitions: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -722,6 +726,134 @@ fn dump_all(env: &Environment, args: &Args) -> lmdb::Result<()> {
 }
 
 // ---------------------------------------------------------------------------
+// Partition analysis
+// ---------------------------------------------------------------------------
+
+struct PartitionStats {
+    count: u64,
+    total_bytes: u128,
+    min_offset: u64,
+    max_offset: u64,
+}
+
+fn analyze_partitions(env: &Environment, args: &Args) -> lmdb::Result<()> {
+    use std::collections::BTreeMap;
+
+    let prefix_bytes: Option<Vec<u8>> = args.prefix.as_ref().map(|p| {
+        let (bytes, desc) = parse_prefix(p);
+        println!("  Prefix: {p}  [{desc}]");
+        bytes
+    });
+
+    let db = env.open_db(None)?;
+    let txn = env.begin_ro_txn()?;
+    let mut cursor = txn.open_ro_cursor(db)?;
+
+    let iter: Box<dyn Iterator<Item = (&[u8], &[u8])>> =
+        match prefix_bytes.as_deref() {
+            Some(p) => Box::new(cursor.iter_from(p)),
+            None => Box::new(cursor.iter_start()),
+        };
+
+    let mut partitions: BTreeMap<u64, PartitionStats> = BTreeMap::new();
+    let mut total_entries = 0u64;
+    let mut offset_entries = 0u64;
+    let mut other_entries = 0u64;
+
+    for (key, val) in iter {
+        if let Some(p) = prefix_bytes.as_deref() {
+            if !key.starts_with(p) {
+                break;
+            }
+        }
+
+        total_entries += 1;
+
+        match decode_value(val) {
+            DecodedValue::Offset { start_offset, length, .. } => {
+                let partition = start_offset / PARTITION_SIZE;
+                let entry = partitions.entry(partition).or_insert(PartitionStats {
+                    count: 0,
+                    total_bytes: 0,
+                    min_offset: u64::MAX,
+                    max_offset: 0,
+                });
+                entry.count += 1;
+                entry.total_bytes += length;
+                if start_offset < entry.min_offset { entry.min_offset = start_offset; }
+                if start_offset > entry.max_offset { entry.max_offset = start_offset; }
+                offset_entries += 1;
+            }
+            _ => {
+                other_entries += 1;
+            }
+        }
+    }
+
+    println!("{}", "=".repeat(88));
+    println!("  Partition Distribution  —  {}", args.db_path.display());
+    println!("{}", "=".repeat(88));
+    println!(
+        "  Total entries scanned: {}  (offset: {}  other: {})",
+        format_count(total_entries),
+        format_count(offset_entries),
+        format_count(other_entries),
+    );
+    println!();
+
+    if partitions.is_empty() {
+        println!("  No offset entries found.");
+    } else {
+        let max_count = partitions.values().map(|s| s.count).max().unwrap_or(1);
+        let bar_width = 40usize;
+
+        println!(
+            "  {:>9}  {:>11}  {:>8}  {:>20}  {:>20}  {}",
+            "partition", "entries", "pct", "min offset", "max offset", "bar"
+        );
+        println!("{}", "-".repeat(88));
+
+        for (&partition, stats) in &partitions {
+            let pct = stats.count as f64 / offset_entries as f64 * 100.0;
+            let bar_len = (stats.count as f64 / max_count as f64 * bar_width as f64).round() as usize;
+            let bar = "#".repeat(bar_len);
+            println!(
+                "  {:>9}  {:>11}  {:>7.2}%  {:>20}  {:>20}  {}",
+                format_count(partition),
+                format_count(stats.count),
+                pct,
+                format_count(stats.min_offset),
+                format_count(stats.max_offset),
+                bar.cyan(),
+            );
+        }
+
+        println!("{}", "-".repeat(88));
+
+        // Summary: partition range covered
+        let first_partition = *partitions.keys().next().unwrap();
+        let last_partition = *partitions.keys().last().unwrap();
+        let span = last_partition - first_partition + 1;
+        let populated = partitions.len() as u64;
+        println!(
+            "  Partitions: {} populated out of {} in range [{}, {}]",
+            format_count(populated),
+            format_count(span),
+            format_count(first_partition),
+            format_count(last_partition),
+        );
+        println!(
+            "  Partition size: {} (~{:.2} TiB)",
+            format_count(PARTITION_SIZE),
+            PARTITION_SIZE as f64 / (1024.0_f64.powi(4)),
+        );
+    }
+
+    println!("{}", "=".repeat(88));
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
 // Entry point
 // ---------------------------------------------------------------------------
 
@@ -741,7 +873,9 @@ fn main() {
         }
     };
 
-    let result = if args.dump {
+    let result = if args.partitions {
+        analyze_partitions(&env, &args)
+    } else if args.dump {
         dump_all(&env, &args)
     } else {
         interactive_loop(&env, &args)
