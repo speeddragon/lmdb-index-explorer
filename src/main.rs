@@ -52,6 +52,18 @@ struct Args {
     /// Analyze partition distribution across all keys
     #[arg(long)]
     partitions: bool,
+
+    /// Show TXID count per depth for a specific block height
+    #[arg(long, value_name = "HEIGHT")]
+    block: Option<u64>,
+
+    /// Look up a TX by base64url ID and show its parent chain and layer depth
+    #[arg(long, value_name = "TXID")]
+    tx: Option<String>,
+
+    /// Find missing block ranges, scanning from highest indexed block down to 0
+    #[arg(long)]
+    missing_blocks: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -854,6 +866,277 @@ fn analyze_partitions(env: &Environment, args: &Args) -> lmdb::Result<()> {
 }
 
 // ---------------------------------------------------------------------------
+// Block height analysis
+// ---------------------------------------------------------------------------
+
+fn analyze_block(env: &Environment, height: u64) -> lmdb::Result<()> {
+    let db = env.open_db(None)?;
+    let txn = env.begin_ro_txn()?;
+
+    // Read the depth marker (informational only — not used to bound iteration).
+    let depth_key = format!("block/{height}/depth");
+    let marker_depth: Option<u64> = match txn.get(db, &depth_key.as_bytes()) {
+        Ok(val) => std::str::from_utf8(val).ok().and_then(|s| s.parse().ok()),
+        Err(lmdb::Error::NotFound) => None,
+        Err(e) => return Err(e),
+    };
+
+    // Scan ALL existing block/<height>/items/<D> keys via prefix cursor.
+    // The depth marker is computed as min() across all L1 TX results, so it
+    // can under-report the true depth (e.g. error TXs return achieved_depth=0,
+    // and the lightweight bundle path hardcodes achieved_depth=2).  Scanning
+    // the actual keys is authoritative.
+    let items_prefix = format!("block/{height}/items/");
+    let mut cursor = txn.open_ro_cursor(db)?;
+    let prefix_bytes = items_prefix.as_bytes();
+
+    let mut depth_counts: Vec<(u64, u64)> = Vec::new();
+    for (key, val) in cursor.iter_from(prefix_bytes) {
+        if !key.starts_with(prefix_bytes) {
+            break;
+        }
+        if let Ok(s) = std::str::from_utf8(key) {
+            if let Some(d_str) = s.strip_prefix(&items_prefix) {
+                if let Ok(d) = d_str.parse::<u64>() {
+                    let count = (val.len() / 32) as u64;
+                    depth_counts.push((d, count));
+                }
+            }
+        }
+    }
+
+    println!("{}", "=".repeat(72));
+    println!("  Block #{height}");
+    println!("{}", "-".repeat(72));
+
+    match marker_depth {
+        None => println!("  Depth marker: not found"),
+        Some(d) => println!("  Depth marker: {d}"),
+    }
+
+    if depth_counts.is_empty() {
+        println!("  Status: no items keys found — block not indexed");
+    } else {
+        println!();
+        println!("  {:>8}  {:>12}  {}", "depth", "tx count", "label");
+        println!("{}", "-".repeat(40));
+        let mut total = 0u64;
+        for (d, count) in &depth_counts {
+            total += count;
+            let label = match d {
+                1 => " (L1 TXs)",
+                2 => " (bundles / data items)",
+                _ => "",
+            };
+            println!("  {:>8}  {:>12}  Layer {d}{label}", d, format_count(*count));
+        }
+        println!("{}", "-".repeat(40));
+        println!("  {:>8}  {:>12}  total", "", format_count(total));
+    }
+
+    println!("{}", "=".repeat(72));
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// TX parent chain lookup
+// ---------------------------------------------------------------------------
+
+enum ParentEntry {
+    Block(u64),
+    Bundle(Vec<u8>),
+    NotFound,
+    UnknownFormat(Vec<u8>),
+}
+
+fn read_parent(txn: &lmdb::RoTransaction<'_>, db: lmdb::Database, raw_id: &[u8]) -> lmdb::Result<ParentEntry> {
+    let mut key = b"parent/".to_vec();
+    key.extend_from_slice(raw_id);
+    match txn.get(db, &key.as_slice()) {
+        Ok(val) => {
+            if val.len() == 9 && val[0] == 0 {
+                let height = u64::from_be_bytes(val[1..9].try_into().unwrap());
+                Ok(ParentEntry::Block(height))
+            } else if val.len() == 33 && val[0] == 1 {
+                Ok(ParentEntry::Bundle(val[1..33].to_vec()))
+            } else {
+                Ok(ParentEntry::UnknownFormat(val.to_vec()))
+            }
+        }
+        Err(lmdb::Error::NotFound) => Ok(ParentEntry::NotFound),
+        Err(e) => Err(e),
+    }
+}
+
+fn lookup_tx(env: &Environment, txid_str: &str) -> lmdb::Result<()> {
+    let raw_id = match URL_SAFE_NO_PAD.decode(txid_str) {
+        Ok(b) if b.len() == 32 => b,
+        _ => {
+            eprintln!("Invalid TXID: expected a 43-character base64url-no-pad string");
+            return Ok(());
+        }
+    };
+
+    let db = env.open_db(None)?;
+    let txn = env.begin_ro_txn()?;
+
+    // Walk up the parent chain, collecting (raw_id) entries until we reach a block.
+    // chain[0] is the queried TX; chain[last] is the deepest ancestor whose parent is a block.
+    let mut chain_ids: Vec<Vec<u8>> = vec![raw_id.clone()];
+    let mut root_block: Option<u64> = None;
+    let mut truncated = false;
+
+    loop {
+        let current = chain_ids.last().unwrap();
+        match read_parent(&txn, db, current)? {
+            ParentEntry::Block(h) => {
+                root_block = Some(h);
+                break;
+            }
+            ParentEntry::Bundle(parent_id) => {
+                if chain_ids.len() >= 32 {
+                    truncated = true;
+                    break;
+                }
+                chain_ids.push(parent_id);
+            }
+            ParentEntry::NotFound => {
+                break;
+            }
+            ParentEntry::UnknownFormat(raw) => {
+                println!("  (unknown parent format: {})", hex_encode(&raw));
+                break;
+            }
+        }
+    }
+
+    // chain_ids[0]  = queried TX  → Layer N
+    // chain_ids[last] = direct child of the block → Layer 1
+    let total_layers = chain_ids.len();
+
+    println!("{}", "=".repeat(72));
+    println!("  TX Ancestry for {txid_str}");
+    println!("{}", "-".repeat(72));
+
+    // Print from the block root down so the hierarchy reads top-to-bottom.
+    if let Some(h) = root_block {
+        println!("  Block #{h}");
+    } else {
+        println!("  (root block not found)");
+    }
+
+    for (i, id) in chain_ids.iter().rev().enumerate() {
+        let layer = i + 1;
+        let b64 = URL_SAFE_NO_PAD.encode(id);
+        let marker = if layer == total_layers { "  ← queried TX" } else { "" };
+        println!("  └─ Layer {layer}: {}{marker}", b64.yellow());
+    }
+
+    if truncated {
+        println!("  (chain truncated at depth 32)");
+    }
+
+    println!("{}", "-".repeat(72));
+    println!("  This TX is at {}", format!("Layer {total_layers}").green().bold());
+    println!("{}", "=".repeat(72));
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Missing block ranges
+// ---------------------------------------------------------------------------
+
+fn find_missing_blocks(env: &Environment) -> lmdb::Result<()> {
+    let db = env.open_db(None)?;
+    let txn = env.begin_ro_txn()?;
+    let mut cursor = txn.open_ro_cursor(db)?;
+
+    let prefix = b"block/";
+    let mut indexed: Vec<u64> = Vec::new();
+
+    for (key, _val) in cursor.iter_from(prefix) {
+        if !key.starts_with(prefix) {
+            break;
+        }
+        // We only care about "block/<N>/depth" markers.
+        if let Ok(s) = std::str::from_utf8(key) {
+            // Pattern: block/<digits>/depth
+            if let Some(rest) = s.strip_prefix("block/") {
+                if let Some((height_str, suffix)) = rest.split_once('/') {
+                    if suffix == "depth" {
+                        if let Ok(h) = height_str.parse::<u64>() {
+                            indexed.push(h);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    drop(cursor);
+
+    if indexed.is_empty() {
+        println!("No indexed blocks found (no block/<N>/depth keys).");
+        return Ok(());
+    }
+
+    // LMDB keys are sorted lexicographically, not numerically, so re-sort.
+    indexed.sort_unstable();
+    let max_height = *indexed.last().unwrap();
+    let min_height = *indexed.first().unwrap();
+    let indexed_set: std::collections::BTreeSet<u64> = indexed.iter().copied().collect();
+    let total_indexed = indexed_set.len() as u64;
+
+    // Collect missing ranges from max_height down to 0.
+    let mut missing_ranges: Vec<(u64, u64)> = Vec::new();
+    let mut range_end: Option<u64> = None;
+
+    for h in (0..=max_height).rev() {
+        if !indexed_set.contains(&h) {
+            match range_end {
+                None => range_end = Some(h),
+                Some(_) => {}
+            }
+        } else if let Some(end) = range_end.take() {
+            missing_ranges.push((h + 1, end));
+        }
+    }
+    if let Some(end) = range_end.take() {
+        missing_ranges.push((0, end));
+    }
+
+    let total_missing: u64 = missing_ranges.iter().map(|(lo, hi)| hi - lo + 1).sum();
+
+    println!("{}", "=".repeat(72));
+    println!("  Missing Block Ranges");
+    println!("{}", "-".repeat(72));
+    println!("  Highest indexed block:  {}", format_count(max_height));
+    println!("  Lowest  indexed block:  {}", format_count(min_height));
+    println!("  Total indexed:          {}", format_count(total_indexed));
+    println!("  Total missing (0..={}): {}", format_count(max_height), format_count(total_missing));
+    println!();
+
+    if missing_ranges.is_empty() {
+        println!("  All blocks from 0 to {} are indexed.", format_count(max_height));
+    } else {
+        println!("  {:>12}  {:>12}  {:>12}", "from", "to", "count");
+        println!("{}", "-".repeat(44));
+        for (lo, hi) in &missing_ranges {
+            println!(
+                "  {:>12}  {:>12}  {:>12}",
+                format_count(*lo),
+                format_count(*hi),
+                format_count(hi - lo + 1),
+            );
+        }
+        println!("{}", "-".repeat(44));
+        println!("  {:>12}  {:>12}  {:>12}", "", "total missing", format_count(total_missing));
+    }
+
+    println!("{}", "=".repeat(72));
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
 // Entry point
 // ---------------------------------------------------------------------------
 
@@ -873,7 +1156,13 @@ fn main() {
         }
     };
 
-    let result = if args.partitions {
+    let result = if let Some(height) = args.block {
+        analyze_block(&env, height)
+    } else if let Some(ref txid) = args.tx {
+        lookup_tx(&env, txid)
+    } else if args.missing_blocks {
+        find_missing_blocks(&env)
+    } else if args.partitions {
         analyze_partitions(&env, &args)
     } else if args.dump {
         dump_all(&env, &args)
